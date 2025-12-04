@@ -13,4 +13,4 @@ python subtract.py data/train
 python binarize.py data/train
 -> data/train/burrhole_mask_autoannot.nii.gz
 
-python export_for_nnunet.py data/train nnunet_dataset_path
+python export_for_nnunet.py data nnunet_dataset_path

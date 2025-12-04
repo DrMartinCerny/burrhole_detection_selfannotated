@@ -6,48 +6,70 @@ from pathlib import Path
 import shutil
 from tqdm import tqdm
 
-
-def find_cases(root: Path):
+def find_cases_with_label(root: Path):
     """
-    Recursively find all subfolders under `root` that contain:
+    Find all case folders under `root` that contain:
       - preop.nii.gz
       - burrhole_mask_autoannot.nii.gz
+    Assumes structure: root/{CASE_ID}/...
     """
     cases = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        fset = set(filenames)
-        if "preop.nii.gz" in fset and "burrhole_mask_autoannot.nii.gz" in fset:
-            cases.append(Path(dirpath))
-    return sorted(cases)
+    if not root.is_dir():
+        return cases
 
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        files = {f.name for f in child.iterdir() if f.is_file()}
+        if "preop.nii.gz" in files and "burrhole_mask_autoannot.nii.gz" in files:
+            cases.append(child)
+    return cases
+
+
+def find_cases_without_label(root: Path):
+    """
+    Find all case folders under `root` that contain at least:
+      - preop.nii.gz
+    We ignore whether a label exists (nnU-Net test set is images-only).
+    """
+    cases = []
+    if not root.is_dir():
+        return cases
+
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        files = {f.name for f in child.iterdir() if f.is_file()}
+        if "preop.nii.gz" in files:
+            cases.append(child)
+    return cases
 
 def ensure_dir(p: Path):
     if not p.exists():
         p.mkdir(parents=True, exist_ok=True)
 
 
-def create_dataset_json(target_root: Path, num_cases: int):
+def create_dataset_json(target_root: Path, num_training: int):
     """
     Create a minimal dataset.json for nnU-Net v2 compatibility.
     """
     dataset_json = {
         "labels": {
-            "0": "background",
-            "1": "burrhole"
+            "background": 0,
+            "burrhole": 1
         },
-        "numTraining": num_cases,
-        "file_ending": ".nii.gz",
-        "overwrite_image_reader_writer": "SimpleITKIO",
-        "modality": {
+        "channel_names": {
             "0": "CT"
-        }
+        },
+        "numTraining": num_training,
+        "file_ending": ".nii.gz"
     }
 
     json_path = target_root / "dataset.json"
     with open(json_path, "w") as f:
         json.dump(dataset_json, f, indent=4)
 
-    print(f"[INFO] Wrote dataset.json with {num_cases} training cases.")
+    print(f"[INFO] Wrote dataset.json with {num_training} training cases.")
 
 
 def main():
@@ -55,6 +77,7 @@ def main():
         print(f"Usage: {sys.argv[0]} <source_root> <target_root>")
         sys.exit(1)
 
+    # source_root = {DATASET_PATH} which contains train/ and test/
     source_root = Path(sys.argv[1]).expanduser().resolve()
     target_root = Path(sys.argv[2]).expanduser().resolve()
 
@@ -62,42 +85,62 @@ def main():
         print(f"Error: {source_root} is not a directory.")
         sys.exit(1)
 
+    train_root = source_root / "train"
+    test_root = source_root / "test"
+
+    if not train_root.is_dir():
+        print(f"Error: {train_root} does not exist or is not a directory.")
+        sys.exit(1)
+
     ensure_dir(target_root)
 
     imagesTr = target_root / "imagesTr"
     labelsTr = target_root / "labelsTr"
+    imagesTs = target_root / "imagesTs"
 
     ensure_dir(imagesTr)
     ensure_dir(labelsTr)
+    ensure_dir(imagesTs)
 
     # -----------------------
-    # Find valid cases
+    # Find training and test cases
     # -----------------------
-    case_dirs = find_cases(source_root)
-    print(f"Found {len(case_dirs)} valid cases.")
+    train_case_dirs = find_cases_with_label(train_root)
+    test_case_dirs = find_cases_without_label(test_root)
+
+    print(f"Found {len(train_case_dirs)} training cases with labels.")
+    print(f"Found {len(test_case_dirs)} test cases (images only).")
 
     # -----------------------
-    # Export each case
+    # Export training cases -> imagesTr + labelsTr
     # -----------------------
-    for idx, case_dir in enumerate(tqdm(case_dirs, desc="Exporting to nnUNet")):
-        case_id = f"case_{idx:04d}"
+    for case_dir in tqdm(train_case_dirs, desc="Exporting TRAIN to nnUNet"):
+        case_id = case_dir.name  # keep original numeric ID
 
         preop_src = case_dir / "preop.nii.gz"
         label_src = case_dir / "burrhole_mask_autoannot.nii.gz"
 
-        # nnUNet naming:
-        # CT image → caseID_0000.nii.gz   (0000 = modality index)
-        # label    → caseID.nii.gz
-        img_dst = imagesTr / f"{case_id}_0000.nii.gz"
+        img_dst = imagesTr   / f"{case_id}_0000.nii.gz"
         label_dst = labelsTr / f"{case_id}.nii.gz"
 
         shutil.copy(preop_src, img_dst)
         shutil.copy(label_src, label_dst)
 
     # -----------------------
-    # Write dataset.json
+    # Export test cases -> imagesTs (no labels)
     # -----------------------
-    create_dataset_json(target_root, len(case_dirs))
+    for case_dir in tqdm(test_case_dirs, desc="Exporting TEST to nnUNet"):
+        case_id = case_dir.name  # keep original numeric ID
+
+        preop_src = case_dir / "preop.nii.gz"
+        img_dst = imagesTs / f"{case_id}_0000.nii.gz"
+
+        shutil.copy(preop_src, img_dst)
+
+    # -----------------------
+    # Write dataset.json (numTraining = #train cases)
+    # -----------------------
+    create_dataset_json(target_root, len(train_case_dirs))
 
     print("[SUCCESS] Export finished.")
 
