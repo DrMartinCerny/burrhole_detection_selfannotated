@@ -16,6 +16,15 @@ MIN_COMPONENT_SIZE = 50        # min number of voxels for connected components
 
 HEAD_CAP_DEPTH_MM = 100.0      # keep only candidates within top X mm from vertex
 
+# delta HU thresholding
+# - If DELTA_HU_THRESHOLD is a number (e.g., 150.0), we use an explicit cutoff:
+#     candidate = (diff_bone >= DELTA_HU_THRESHOLD)
+# - If DELTA_HU_THRESHOLD is None, we fall back to Otsu on diff_bone (previous behavior).
+DELTA_HU_THRESHOLD = 700.0  # set to None to use Otsu
+
+# NEW: remove disconnected high/medium-HU objects (e.g., headrest) by keeping only skull bone CC
+KEEP_LARGEST_BONE_COMPONENT = True
+
 
 def find_case_dirs(root: Path):
     """
@@ -28,6 +37,17 @@ def find_case_dirs(root: Path):
         if "preop.nii.gz" in filenames and "diff.nii.gz" in filenames:
             case_dirs.append(Path(dirpath))
     return sorted(case_dirs)
+
+
+def keep_largest_component(binary_mask: sitk.Image) -> sitk.Image:
+    """
+    Keep only the largest connected component of a 0/1 binary mask.
+    """
+    cc = sitk.ConnectedComponent(binary_mask)
+    relabel = sitk.RelabelComponent(cc, sortByObjectSize=True)  # label 1 = largest
+    out = sitk.Cast(relabel == 1, sitk.sitkUInt8)
+    out.CopyInformation(binary_mask)
+    return out
 
 
 def compute_head_cap_mask(reference_image: sitk.Image) -> sitk.Image:
@@ -105,10 +125,10 @@ def create_burrhole_mask(preop_path: Path,
       1) Threshold preop to get bone mask.
       2) Keep only positive differences (bone lost).
       3) Restrict diff to bone region.
-      4) Otsu threshold to get candidate regions.
+      4) Explicit threshold (if DELTA_HU_THRESHOLD is set) else Otsu threshold.
       5) Morphological cleanup + min component size.
       6) Restrict to top HEAD_CAP_DEPTH_MM of the head (head cap).
-      7) Save as burrhole_mask_auto.nii.gz.
+      7) Save as burrhole_mask_autoannot.nii.gz.
     """
     # Load images as float
     preop = sitk.ReadImage(str(preop_path), sitk.sitkFloat32)
@@ -123,14 +143,30 @@ def create_burrhole_mask(preop_path: Path,
         outsideValue=0,
     )
 
+    # NEW: keep only the largest connected bone component (skull),
+    # removing disconnected headrest/supports regardless of HU.
+    if KEEP_LARGEST_BONE_COMPONENT:
+        bone_mask = keep_largest_component(bone_mask)
+
     # 2) Keep only positive diff (preop > postop)
     diff_pos = sitk.Clamp(diff, lowerBound=0.0)
 
     # 3) Restrict to bone region
     diff_bone = diff_pos * sitk.Cast(bone_mask, sitk.sitkFloat32)
 
-    # 4) Otsu threshold on diff restricted to bone
-    candidate_mask = sitk.OtsuThreshold(diff_bone, 0, 1)  # 0/1
+    # 4) Candidate thresholding: explicit or Otsu
+    if DELTA_HU_THRESHOLD is None:
+        # previous behavior: automatic threshold
+        candidate_mask = sitk.OtsuThreshold(diff_bone, 0, 1)  # 0/1
+    else:
+        # explicit delta HU cutoff
+        candidate_mask = sitk.BinaryThreshold(
+            diff_bone,
+            lowerThreshold=float(DELTA_HU_THRESHOLD),
+            upperThreshold=1e9,
+            insideValue=1,
+            outsideValue=0,
+        )
 
     # 5a) Morphological closing to fill small gaps
     candidate_mask = sitk.BinaryMorphologicalClosing(
