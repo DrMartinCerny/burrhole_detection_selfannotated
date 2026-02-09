@@ -22,7 +22,7 @@ HEAD_CAP_DEPTH_MM = 100.0      # keep only candidates within top X mm from verte
 # - If DELTA_HU_THRESHOLD is None, we fall back to Otsu on diff_bone (previous behavior).
 DELTA_HU_THRESHOLD = 700.0  # set to None to use Otsu
 
-# NEW: remove disconnected high/medium-HU objects (e.g., headrest) by keeping only skull bone CC
+# remove disconnected high/medium-HU objects (e.g., headrest) by keeping only skull bone CC
 KEEP_LARGEST_BONE_COMPONENT = True
 
 
@@ -37,6 +37,19 @@ def find_case_dirs(root: Path):
         if "preop.nii.gz" in filenames and "diff.nii.gz" in filenames:
             case_dirs.append(Path(dirpath))
     return sorted(case_dirs)
+
+
+def force_same_geometry(img: sitk.Image, ref: sitk.Image) -> sitk.Image:
+    """
+    Force img to have EXACT same spacing/origin/direction as ref.
+    Use ONLY if you are confident both images already share the same voxel grid
+    and any mismatch is just floating-point metadata noise.
+    """
+    out = sitk.Image(img)  # shallow copy
+    out.SetSpacing(ref.GetSpacing())
+    out.SetOrigin(ref.GetOrigin())
+    out.SetDirection(ref.GetDirection())
+    return out
 
 
 def keep_largest_component(binary_mask: sitk.Image) -> sitk.Image:
@@ -94,16 +107,13 @@ def compute_head_cap_mask(reference_image: sitk.Image) -> sitk.Image:
     mask = sitk.Image(size, sitk.sitkUInt8)
     mask.CopyInformation(reference_image)
 
-    # We’ll fill it with 1s slice-wise
-    arr = sitk.GetArrayFromImage(mask)  # note: array is z, y, x
+    # Fill with 1s in the chosen slice range (via numpy array)
+    arr = sitk.GetArrayFromImage(mask)  # note: array order is z, y, x
 
     # Map si_axis (0:x,1:y,2:z) to numpy axis in z,y,x order
-    # SimpleITK GetArrayFromImage returns [k,z-axis][j,y][i,x]:
-    # so numpy_axis_for_sitk = {0: 2, 1:1, 2:0}
     axis_map = {0: 2, 1: 1, 2: 0}
     np_axis = axis_map[si_axis]
 
-    # Build a slice object to select the head cap range along np_axis
     slicer = [slice(None), slice(None), slice(None)]
     slicer[np_axis] = slice(start_slice, end_slice + 1)
     arr[tuple(slicer)] = 1
@@ -134,6 +144,12 @@ def create_burrhole_mask(preop_path: Path,
     preop = sitk.ReadImage(str(preop_path), sitk.sitkFloat32)
     diff = sitk.ReadImage(str(diff_path), sitk.sitkFloat32)
 
+    # IMPORTANT FIX:
+    # Some cases fail because direction/origin/spacing differ by tiny floating-point noise,
+    # triggering ITK's "Inputs do not occupy the same physical space!" checks.
+    # If your upstream pipeline guarantees same voxel grid, force exact metadata match:
+    diff = force_same_geometry(diff, preop)
+
     # 1) Bone mask from preop CT (HU threshold)
     bone_mask = sitk.BinaryThreshold(
         preop,
@@ -143,23 +159,23 @@ def create_burrhole_mask(preop_path: Path,
         outsideValue=0,
     )
 
-    # NEW: keep only the largest connected bone component (skull),
-    # removing disconnected headrest/supports regardless of HU.
+    # keep only the largest connected bone component (skull)
     if KEEP_LARGEST_BONE_COMPONENT:
         bone_mask = keep_largest_component(bone_mask)
+
+    # ensure bone_mask metadata matches preop exactly
+    bone_mask = force_same_geometry(bone_mask, preop)
 
     # 2) Keep only positive diff (preop > postop)
     diff_pos = sitk.Clamp(diff, lowerBound=0.0)
 
-    # 3) Restrict to bone region
+    # 3) Restrict to bone region (this is where Multiply would crash if metadata isn't identical)
     diff_bone = diff_pos * sitk.Cast(bone_mask, sitk.sitkFloat32)
 
     # 4) Candidate thresholding: explicit or Otsu
     if DELTA_HU_THRESHOLD is None:
-        # previous behavior: automatic threshold
         candidate_mask = sitk.OtsuThreshold(diff_bone, 0, 1)  # 0/1
     else:
-        # explicit delta HU cutoff
         candidate_mask = sitk.BinaryThreshold(
             diff_bone,
             lowerThreshold=float(DELTA_HU_THRESHOLD),
@@ -169,10 +185,7 @@ def create_burrhole_mask(preop_path: Path,
         )
 
     # 5a) Morphological closing to fill small gaps
-    candidate_mask = sitk.BinaryMorphologicalClosing(
-        candidate_mask,
-        [1, 1, 1]
-    )
+    candidate_mask = sitk.BinaryMorphologicalClosing(candidate_mask, [1, 1, 1])
 
     # 5b) Remove tiny connected components
     cc = sitk.ConnectedComponent(candidate_mask)
@@ -191,9 +204,12 @@ def create_burrhole_mask(preop_path: Path,
 
     # 6) Restrict to head cap (top HEAD_CAP_DEPTH_MM)
     head_cap_mask = compute_head_cap_mask(preop)
+    head_cap_mask = force_same_geometry(head_cap_mask, preop)
+
     final_mask = cleaned_mask * head_cap_mask  # logical AND in 0/1
 
-    # 7) Save final burr-hole mask
+    # 7) Save final burr-hole mask (ensure exact geometry)
+    final_mask = force_same_geometry(final_mask, preop)
     sitk.WriteImage(final_mask, str(output_mask_path))
 
 
